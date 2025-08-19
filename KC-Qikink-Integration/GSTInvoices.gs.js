@@ -15,12 +15,12 @@
 const SHOPIFY_STORE_DOMAIN      = getCellValue("Automation", "H5") + ".myshopify.com"; // e.g., "example.myshopify.com"
 const SHOPIFY_API_VERSION       = getCellValue("Automation", "H7");                    // e.g., "2024-01"
 const SHOPIFY_ACCESS_TOKEN      = getCellValue("Automation", "H6");                    // Admin API access token
-const INCLUDE_ONLY_PAID_ORDERS  = true;                                                // include only 'paid' or 'partially_paid'
+const INCLUDE_ONLY_PAID_ORDERS  = false;                                                // include only 'paid' or 'partially_paid'
 const TIMEZONE                  = "Asia/Kolkata";                                       // all date math/formatting in this TZ
 
 // Drive folder for output (prefer ID if present)
-const CSV_FOLDER_ID             = getCellValue("Automation", "H9");; // leave empty to fallback
-const CSV_FOLDER_NAME           = "GST Exports";                        // fallback only
+const CSV_FOLDER_ID             = getCellValue("Automation", "H9"); // leave empty to fallback
+const CSV_FOLDER_NAME           = "GST Exports";                     // fallback only
 
 // ✅ Email recipient (leave blank to default to the active user's email)
 const REPORT_EMAIL              = getCellValue("Automation", "H8"); // e.g., "me@mycompany.com" or ""
@@ -90,20 +90,24 @@ function exportGstCsvForMonth(year, month) {
     // 3) Filter for paid/non-cancelled if configured
     const filtered = filterOrders(allOrders);
 
-    // 4) Build rows for Sheets
-    const rows = buildSheetRows(filtered);
+    // 3a) Split into normal vs returned
+    const returnedOrders = filtered.filter(isReturnedOrder);
+    const normalOrders   = filtered.filter(o => !isReturnedOrder(o));
 
-    // 5) Save Google Sheet to Drive with required filename format:
-    //    GST_Invoices_{YYYYMM}_{MONTH}-{YYYYMMDD}.csv
-    //    YYYYMM is the TARGET month (not current)
-    const yyyymm  = `${pad(y,4)}${pad(m,2)}`;
+    // 4) Build rows for Sheets (same columns)
+    const rowsOrders  = buildSheetRows(normalOrders);
+    const rowsReturns = buildSheetRows(returnedOrders);
+
+    // 5) Save Google Sheet in Drive with required filename format:
+    //    GST_Invoices_{YYYYMM}_{MONTH}-{YYYYMMDD}.csv (Sheet title)
+    const yyyymm   = `${pad(y,4)}${pad(m,2)}`;
     const filename = `GST_Invoices_${yyyymm}_${monthNameUpper}-${todayYmd}.csv`;
 
     const folder  = resolveOutputFolder();
-    const fileUrl = saveAsGoogleSheetInFolder(folder, filename, rows);
+    const { url: fileUrl } = saveAsGoogleSheetInFolder(folder, filename, rowsOrders, rowsReturns);
 
     // 6) Notify user
-    const msg = `Exported ${filtered.length} orders for ${monthNameUpper} ${y}.\nFile: ${filename}\nLink: ${fileUrl}`;
+    const msg = `Exported Orders: ${normalOrders.length}, Returns: ${returnedOrders.length} for ${monthNameUpper} ${y}.\nFile: ${filename}\nLink: ${fileUrl}`;
     SpreadsheetApp.getActive().toast(msg, 'Shopify GST Export', 10);
 
     // 7) Email the link
@@ -116,7 +120,8 @@ function exportGstCsvForMonth(year, month) {
         `The GST Invoices export file has been generated successfully.`,
         ``,
         `Month: ${monthNameUpper} ${y}`,
-        `Orders Exported: ${filtered.length}`,
+        `Orders Exported: ${normalOrders.length}`,
+        `Returns Exported: ${returnedOrders.length}`,
         `File: ${filename}`,
         `Link: ${fileUrl}`,
         ``,
@@ -201,10 +206,10 @@ function fetchAllOrdersPaginated(startIso, endIso) {
     created_at_max: endIso,
     status: 'any',
     limit: '250',
-    // include customer and tags to reduce redaction surprises
+    // include customer, tags, refunds to detect returns
     fields: [
       'name','created_at','billing_address','shipping_address','line_items',
-      'total_price','financial_status','cancelled_at','customer','tags','customer_id'
+      'total_price','financial_status','cancelled_at','customer','tags','customer_id','refunds'
     ].join(',')
   };
 
@@ -237,6 +242,45 @@ function filterOrders(orders) {
     }
     return true;
   });
+}
+
+/**
+ * Determine if an order is "returned".
+ * Priority:
+ *  1) refunds[].refund_line_items[].restock_type === 'return'  -> returned (REST, precise)
+ *  2) financial_status in ['refunded','partially_refunded'] AND no refunds array -> likely returned (fallback)
+ *  3) tags contain 'return' -> store convention fallback
+ * Notes:
+ *  - 'voided' indicates an uncaptured authorization canceled (not a return).
+ */
+function isReturnedOrder(order) {
+  // 1) Examine refunds for explicit returned line items
+  if (Array.isArray(order.refunds) && order.refunds.length > 0) {
+    for (const r of order.refunds) {
+      const items = (r && (r.refund_line_items || r.refundLineItems)) || [];
+      for (const rli of items) {
+        const restockType = String((rli && (rli.restock_type || rli.restockType)) || '').toLowerCase();
+        const qty = Number(rli && rli.quantity) || 0;
+        if (restockType === 'return' && qty > 0) {
+          return true;
+        }
+      }
+    }
+    // If refunds exist but none are marked returned, treat as NOT returned here
+    // (they might be 'cancel' or 'no_restock' refunds)
+  }
+
+  // 2) Fallback to financial status if refunds are unavailable
+  const fs = String(order.financial_status || '').toLowerCase();
+  if ((fs === 'refunded' || fs === 'partially_refunded') && (!order.refunds || order.refunds.length === 0)) {
+    return true;
+  }
+
+  // 3) Optional tag-based fallback (store-specific process)
+  const tags = String(order.tags || '').toLowerCase();
+  if (tags.includes('return')) return true;
+
+  return false;
 }
 
 /* ============================================================================
@@ -418,24 +462,39 @@ function buildSheetRows(orders) {
 }
 
 /**
- * Create a Google Sheet directly in a given Drive folder and write rows.
- * Returns the file URL.
+ * Create a Google Sheet directly in a given Drive folder and write rows to:
+ *  - "Orders"   (normal orders)
+ *  - "Returns"  (returned orders)
+ * Returns { url, spreadsheetId }.
  */
-function saveAsGoogleSheetInFolder(folder, filename, rows) {
+function saveAsGoogleSheetInFolder(folder, filename, rowsOrders, rowsReturns) {
   const ss = SpreadsheetApp.create(filename.replace(/\.csv$/i, '')); // drop .csv if present for Sheet title
   const file = DriveApp.getFileById(ss.getId());
 
-  // Move to target folder (single move; newer Apps Script supports moveTo)
+  // Move to target folder (single move)
   file.moveTo(folder);
 
-  // Write data
-  const sh = ss.getActiveSheet();
-  sh.clear();
-  if (rows.length) {
-    sh.getRange(1, 1, rows.length, rows[0].length).setValues(rows);
-    sh.autoResizeColumns(1, rows[0].length);
+  // ORDERS sheet (rename default to "Orders")
+  const ordersSheet = ss.getActiveSheet();
+  ordersSheet.setName('Orders');
+  ordersSheet.clear();
+  if (rowsOrders && rowsOrders.length) {
+    ordersSheet.getRange(1, 1, rowsOrders.length, rowsOrders[0].length).setValues(rowsOrders);
+    ordersSheet.autoResizeColumns(1, rowsOrders[0].length);
   }
-  return ss.getUrl();
+
+  // RETURNS sheet (create and populate)
+  let returnsSheet = ss.getSheetByName('Returns');
+  if (!returnsSheet) returnsSheet = ss.insertSheet('Returns');
+  returnsSheet.clear();
+
+  const rowsR = (rowsReturns && rowsReturns.length) ? rowsReturns : [ (rowsOrders && rowsOrders[0]) ? rowsOrders[0] : [] ];
+  if (rowsR.length && rowsR[0].length) {
+    returnsSheet.getRange(1, 1, rowsR.length, rowsR[0].length).setValues(rowsR);
+    returnsSheet.autoResizeColumns(1, rowsR[0].length);
+  }
+
+  return { url: ss.getUrl(), spreadsheetId: ss.getId() };
 }
 
 /* ============================================================================
@@ -659,4 +718,23 @@ function toQuery(obj) {
     parts.push(encodeURIComponent(k) + '=' + encodeURIComponent(String(v)));
   }
   return parts.join('&');
+}
+
+/**
+ * Placeholder: implement the actual conversion if needed.
+ * Converts a Qikink order number into your Shopify order number format (e.g., prepend/transform).
+ */
+function convertQikinkOrderNumberToShopifyNumber(qikinkOrderNo) {
+  // Example (dummy): return '#KC' + String(qikinkOrderNo).replace(/\D+/g, '');
+  return String(qikinkOrderNo).trim();
+}
+
+/**
+ * Get a cell's display value (throws if sheet missing).
+ */
+function getCellValue(sheetName, a1Notation) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(sheetName);
+  if (!sh) throw new Error(`Sheet "${sheetName}" not found for getCellValue(${a1Notation})`);
+  return sh.getRange(a1Notation).getDisplayValue().trim();
 }
