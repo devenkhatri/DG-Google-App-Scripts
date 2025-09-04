@@ -12,18 +12,18 @@
  * CONFIGURATION (EDIT THESE)
  * -----------------------------
  */
-const SHOPIFY_STORE_DOMAIN      = getCellValue("Automation", "H5") + ".myshopify.com"; // e.g., "example.myshopify.com"
-const SHOPIFY_API_VERSION       = getCellValue("Automation", "H7");                    // e.g., "2024-01"
-const SHOPIFY_ACCESS_TOKEN      = getCellValue("Automation", "H6");                    // Admin API access token
-const INCLUDE_ONLY_PAID_ORDERS  = false;                                                // include only 'paid' or 'partially_paid'
-const TIMEZONE                  = "Asia/Kolkata";                                       // all date math/formatting in this TZ
+const SHOPIFY_STORE_DOMAIN = getCellValue("Automation", "H5") + ".myshopify.com"; // e.g., "example.myshopify.com"
+const SHOPIFY_API_VERSION = getCellValue("Automation", "H7");                    // e.g., "2024-01"
+const SHOPIFY_ACCESS_TOKEN = getCellValue("Automation", "H6");                    // Admin API access token
+const INCLUDE_ONLY_PAID_ORDERS = false;                                                // include only 'paid' or 'partially_paid'
+const TIMEZONE = "Asia/Kolkata";                                       // all date math/formatting in this TZ
 
 // Drive folder for output (prefer ID if present)
-const CSV_FOLDER_ID             = getCellValue("Automation", "H9"); // leave empty to fallback
-const CSV_FOLDER_NAME           = "GST Exports";                     // fallback only
+const CSV_FOLDER_ID = getCellValue("Automation", "H9"); // leave empty to fallback
+const CSV_FOLDER_NAME = "GST Exports";                     // fallback only
 
-// ✅ Email recipient (leave blank to default to the active user's email)
-const REPORT_EMAIL              = getCellValue("Automation", "H8"); // e.g., "me@mycompany.com" or ""
+// ✅ Email recipient(s) comma-seperated if multiple (leave blank to default to the active user's email)
+const REPORT_EMAIL = getCellValue("Automation", "H8"); // e.g., "me@mycompany.com" or ""
 
 // Simple in-memory cache per execution to reduce API calls
 const _customerCache = Object.create(null);
@@ -65,7 +65,7 @@ function exportGstCsvPromptForMonth() {
     ui.alert('Invalid format. Please enter YYYY-MM, e.g., 2025-07.');
     return;
   }
-  const year  = parseInt(m[1], 10);
+  const year = parseInt(m[1], 10);
   const month = parseInt(m[2], 10);
   if (month < 1 || month > 12) {
     ui.alert('Month must be between 01 and 12.');
@@ -91,46 +91,155 @@ function exportGstCsvForMonth(year, month) {
 
     // 3a) Split into normal vs returned
     const returnedOrders = filtered.filter(isReturnedOrder);
-    const normalOrders   = filtered.filter(o => !isReturnedOrder(o));
+    const normalOrders = filtered.filter(o => !isReturnedOrder(o));
 
     // 4) Build rows for Sheets (same columns)
-    const rowsOrders  = buildSheetRows(normalOrders);
+    const rowsOrders = buildSheetRows(normalOrders);
     const rowsReturns = buildSheetRows(returnedOrders);
 
     // 5) Save Google Sheet in Drive with required filename format:
     //    GST_Invoices_{YYYYMM}_{MONTH}-{YYYYMMDD}.csv (Sheet title)
-    const yyyymm   = `${pad(y,4)}${pad(m,2)}`;
-    const filename = `GST_Invoices_${yyyymm}_${monthNameUpper}-${todayYmd}.csv`;
+    const yyyymm = `${pad(y, 4)}${pad(m, 2)}`;
+    const filename = `KumudCreations_GST_Invoices_${yyyymm}_${monthNameUpper}-${todayYmd}.csv`;
 
-    const folder  = resolveOutputFolder();
+    const folder = resolveOutputFolder();
     const { url: fileUrl } = saveAsGoogleSheetInFolder(folder, filename, rowsOrders, rowsReturns);
 
-    // 6) Notify user
-    const msg = `Exported Orders: ${normalOrders.length}, Returns: ${returnedOrders.length} for ${monthNameUpper} ${y}.\nFile: ${filename}\nLink: ${fileUrl}`;
-    SpreadsheetApp.getActive().toast(msg, 'Shopify GST Export', 10);
+    // Generate CSV attachments with comprehensive error handling      
+    let csvAttachmentInfo = '';
+    let csvErrorMessage = '';
+    let attachments = [];
+    let fallbackToLinkOnly = false;
 
-    // 7) Email the link
+    // 6) Generate CSV attachments and send email
     const recipient = resolveReportRecipient();
     if (recipient) {
-      const subject = `Kumud Creations GST Invoices Export: ${filename}`;
+      const subject = `MONTHLY REPORT: ${filename}`;
+
+      try {
+        // Generate CSV attachments after Google Sheet creation and before email sending
+        attachments = generateCsvAttachments(rowsOrders, rowsReturns, filename.replace(/\.csv$/, ''));
+
+        // Build attachment info for email body
+        if (attachments.length > 0) {
+          csvAttachmentInfo = 'Attached Files:\n';
+          for (const attachment of attachments) {
+            const recordCount = attachment.fileName.includes('Orders') ? normalOrders.length : returnedOrders.length;
+            csvAttachmentInfo += `- ${attachment.fileName} (${recordCount} records)\n`;
+          }
+          csvAttachmentInfo += '\nGoogle Sheets Link (backup): ' + fileUrl;
+        }
+      } catch (csvError) {
+        // Enhanced error logging for CSV generation failures
+        csvErrorMessage = csvError && csvError.message ? csvError.message : String(csvError || 'Unknown CSV generation error');
+        console.error('CSV generation failed, falling back to link-only email. Error details:', {
+          error: csvErrorMessage,
+          timestamp: new Date().toISOString(),
+          ordersCount: normalOrders ? normalOrders.length : 0,
+          returnsCount: returnedOrders ? returnedOrders.length : 0,
+          filename: filename,
+          stackTrace: csvError && csvError.stack ? csvError.stack : 'No stack trace available'
+        });
+        fallbackToLinkOnly = true;
+        attachments = [];
+      }
+
+      // Build email body
       const body = [
         `Hello Team,`,
         ``,
-        `The GST Invoices export file has been generated successfully.`,
+        ``,
+        fallbackToLinkOnly
+          ? `The GST Invoices export file has been generated successfully.`
+          : `The GST Invoices export files have been generated successfully and are attached to this email.`,
         ``,
         `Month: ${monthNameUpper} ${y}`,
         `Orders Exported: ${normalOrders.length}`,
         `Returns Exported: ${returnedOrders.length}`,
-        `File: ${filename}`,
-        `Link: ${fileUrl}`,
+        fallbackToLinkOnly ? `File: ${filename}` : '',
+        fallbackToLinkOnly ? `Link: ${fileUrl}` : csvAttachmentInfo,        
+        ``,
         ``,
         `Regards,`,
-        `Kumud Creations`
+        `Kumud Creations Team`
       ].join('\n');
-      MailApp.sendEmail(recipient, subject, body);
+
+      // Send email with attachments or fallback to link-only with additional error handling
+      try {
+        if (attachments.length > 0) {
+          // Convert attachment objects to blobs for MailApp
+          const emailAttachments = attachments.map(att => att.content);
+          MailApp.sendEmail({
+            to: recipient,
+            subject: subject,
+            body: body,
+            attachments: emailAttachments
+          });
+        } else {
+          MailApp.sendEmail(recipient, subject, body);
+        }
+      } catch (emailError) {
+        // If email with attachments fails, try fallback to link-only email
+        const emailErrorMessage = emailError && emailError.message ? emailError.message : String(emailError);
+        console.error('Email with attachments failed, attempting fallback to link-only email. Error details:', {
+          error: emailErrorMessage,
+          timestamp: new Date().toISOString(),
+          attachmentCount: attachments ? attachments.length : 0,
+          recipient: recipient
+        });
+
+        try {
+          // Fallback email body for attachment failure
+          const fallbackBody = [
+            `Hello Team,`,
+            ``,
+            `The GST Invoices export file has been generated successfully.`,
+            `Note: CSV attachments could not be sent due to email delivery issues.`,
+            ``,
+            `Month: ${monthNameUpper} ${y}`,
+            `Orders Exported: ${normalOrders.length}`,
+            `Returns Exported: ${returnedOrders.length}`,
+            `File: ${filename}`,
+            `Link: ${fileUrl}`,
+            ``,
+            `Regards,`,
+            `Kumud Creations`
+          ].join('\n');
+
+          MailApp.sendEmail(recipient, subject, fallbackBody);
+          fallbackToLinkOnly = true;
+        } catch (fallbackEmailError) {
+          const fallbackErrorMessage = fallbackEmailError && fallbackEmailError.message ? fallbackEmailError.message : String(fallbackEmailError);
+          console.error('Fallback email also failed:', {
+            error: fallbackErrorMessage,
+            timestamp: new Date().toISOString(),
+            recipient: recipient
+          });
+          throw new Error(`Both attachment and fallback email delivery failed: ${emailErrorMessage}; Fallback: ${fallbackErrorMessage}`);
+        }
+      }
     } else {
       console.warn('No REPORT_EMAIL and could not resolve active user email; skipping email send.');
     }
+
+    // 7) Notify user with detailed status including error information
+    let attachmentStatus;
+    let toastTitle = 'Shopify GST Export';
+
+    if (attachments && attachments.length > 0 && !fallbackToLinkOnly) {
+      attachmentStatus = 'CSV attachments included';
+    } else if (fallbackToLinkOnly && csvErrorMessage) {
+      attachmentStatus = `Link-only (CSV generation failed: ${csvErrorMessage})`;
+      toastTitle = 'Shopify GST Export - CSV Error';
+    } else if (fallbackToLinkOnly) {
+      attachmentStatus = 'Link-only (email attachment failed)';
+      toastTitle = 'Shopify GST Export - Email Error';
+    } else {
+      attachmentStatus = 'Link-only (no data for attachments)';
+    }
+
+    const msg = `Exported Orders: ${normalOrders.length}, Returns: ${returnedOrders.length} for ${monthNameUpper} ${y}.\nFile: ${filename}\nLink: ${fileUrl}\nEmail: ${attachmentStatus}`;
+    SpreadsheetApp.getActive().toast(msg, toastTitle, 15);
 
   } catch (err) {
     const uiMsg = `Export failed: ${err && err.message ? err.message : err}`;
@@ -168,15 +277,15 @@ function getMonthRange(year, month, tz) {
   const lastDay = new Date(year, month, 0).getDate(); // JS: passing (year, month, 0) gives last day of 'month'
 
   const monthNameUpper = Utilities.formatDate(new Date(year, month - 1, 1), tz, 'MMMM').toUpperCase();
-  const todayYmd       = Utilities.formatDate(new Date(), tz, 'yyyyMMddHHmm');
+  const todayYmd = Utilities.formatDate(new Date(), tz, 'yyyyMMddHHmm');
 
   // Build timezone offset like +05:30
   const midMonth = new Date(year, month - 1, Math.min(15, lastDay));
   const offsetNoColon = Utilities.formatDate(midMonth, tz, 'Z');        // e.g., +0530
-  const offset        = offsetNoColon.replace(/([+-])(\d{2})(\d{2})/, '$1$2:$3');
+  const offset = offsetNoColon.replace(/([+-])(\d{2})(\d{2})/, '$1$2:$3');
 
   const startIso = `${pad(year, 4)}-${pad(month, 2)}-01T00:00:00${offset}`;
-  const endIso   = `${pad(year, 4)}-${pad(month, 2)}-${pad(lastDay, 2)}T23:59:59${offset}`;
+  const endIso = `${pad(year, 4)}-${pad(month, 2)}-${pad(lastDay, 2)}T23:59:59${offset}`;
 
   return { startIso, endIso, monthNameUpper, todayYmd, year, month };
 }
@@ -207,8 +316,8 @@ function fetchAllOrdersPaginated(startIso, endIso) {
     limit: '250',
     // include customer, tags, refunds to detect returns
     fields: [
-      'name','created_at','billing_address','shipping_address','line_items',
-      'total_price','financial_status','cancelled_at','customer','tags','customer_id','refunds'
+      'name', 'created_at', 'billing_address', 'shipping_address', 'line_items',
+      'total_price', 'financial_status', 'cancelled_at', 'customer', 'tags', 'customer_id', 'refunds'
     ].join(',')
   };
 
@@ -363,8 +472,8 @@ function loadCustomerNameLookup() {
 
   // Load only last 2000 rows of the entire row width (so column indexes are valid)
   const startRow = Math.max(2, lastRow - 2000 + 1);
-  const numRows  = lastRow - startRow + 1;
-  const values   = sh.getRange(startRow, 1, numRows, sh.getLastColumn()).getValues();
+  const numRows = lastRow - startRow + 1;
+  const values = sh.getRange(startRow, 1, numRows, sh.getLastColumn()).getValues();
 
   const lookup = {};
   for (let i = 0; i < values.length; i++) {
@@ -487,7 +596,7 @@ function saveAsGoogleSheetInFolder(folder, filename, rowsOrders, rowsReturns) {
   if (!returnsSheet) returnsSheet = ss.insertSheet('Returns');
   returnsSheet.clear();
 
-  const rowsR = (rowsReturns && rowsReturns.length) ? rowsReturns : [ (rowsOrders && rowsOrders[0]) ? rowsOrders[0] : [] ];
+  const rowsR = (rowsReturns && rowsReturns.length) ? rowsReturns : [(rowsOrders && rowsOrders[0]) ? rowsOrders[0] : []];
   if (rowsR.length && rowsR[0].length) {
     returnsSheet.getRange(1, 1, rowsR.length, rowsR[0].length).setValues(rowsR);
     returnsSheet.autoResizeColumns(1, rowsR[0].length);
@@ -670,7 +779,7 @@ function maybeThrottle(resp) {
     const parts = limitRaw.split('/');
     if (parts.length === 2) {
       const used = parseInt(parts[0], 10);
-      const cap  = parseInt(parts[1], 10) || 40;
+      const cap = parseInt(parts[1], 10) || 40;
       if (isFinite(used) && isFinite(cap) && used > cap - 5) {
         Utilities.sleep(800); // cool-off
       }
@@ -697,11 +806,143 @@ function parseNextUrlFromLinkHeader(resp) {
 }
 
 /* ============================================================================
+ * CSV UTILITIES
+ * ==========================================================================*/
+
+/**
+ * Converts a 2D array of rows to CSV format string.
+ * Handles proper CSV escaping for commas, quotes, and newlines in cell data.
+ * 
+ * @param {Array<Array>} rows - 2D array representing sheet data
+ * @returns {string} CSV formatted string
+ */
+function convertRowsToCSV(rows) {
+  try {
+    if (!Array.isArray(rows) || rows.length === 0) {
+      return '';
+    }
+
+    const csvRows = [];
+
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      if (!Array.isArray(row)) {
+        console.warn(`convertRowsToCSV: Skipping non-array row at index ${i}`);
+        continue;
+      }
+
+      const csvCells = [];
+
+      for (let j = 0; j < row.length; j++) {
+        try {
+          let cellValue = String(row[j] || '');
+
+          // Check if the cell needs to be quoted (contains comma, quote, or newline)
+          const needsQuoting = cellValue.includes(',') ||
+            cellValue.includes('"') ||
+            cellValue.includes('\n') ||
+            cellValue.includes('\r');
+
+          if (needsQuoting) {
+            // Escape existing quotes by doubling them
+            cellValue = cellValue.replace(/"/g, '""');
+            // Wrap in quotes
+            cellValue = `"${cellValue}"`;
+          }
+
+          csvCells.push(cellValue);
+        } catch (cellError) {
+          console.warn(`convertRowsToCSV: Error processing cell at row ${i}, column ${j}:`, cellError);
+          csvCells.push(''); // Use empty string for problematic cells
+        }
+      }
+
+      csvRows.push(csvCells.join(','));
+    }
+
+    return csvRows.join('\n');
+  } catch (error) {
+    console.error('convertRowsToCSV: Critical error during CSV conversion:', error);
+    throw new Error(`CSV conversion failed: ${error.message || error}`);
+  }
+}
+
+/**
+ * Generates CSV attachments for email from orders and returns data.
+ * Creates separate attachments for Orders and Returns when data exists (more than just headers).
+ * 
+ * @param {Array<Array>} rowsOrders - Orders data rows including headers
+ * @param {Array<Array>} rowsReturns - Returns data rows including headers  
+ * @param {string} baseFilename - Base filename without extension (e.g., "GST_Invoices_202501_JANUARY-202501091234")
+ * @returns {Array} Array of attachment objects for MailApp.sendEmail
+ */
+function generateCsvAttachments(rowsOrders, rowsReturns, baseFilename) {
+  try {
+    if (!baseFilename || typeof baseFilename !== 'string') {
+      throw new Error('Invalid baseFilename provided for CSV attachment generation');
+    }
+
+    const attachments = [];
+
+    // Generate Orders CSV attachment when orders data exists (more than just headers)
+    if (Array.isArray(rowsOrders) && rowsOrders.length > 1) {
+      try {
+        const ordersCSV = convertRowsToCSV(rowsOrders);
+        const ordersFilename = `${baseFilename}_Orders.csv`;
+
+        if (!ordersCSV) {
+          console.warn('generateCsvAttachments: Orders CSV conversion resulted in empty content');
+        } else {
+          const ordersBlob = Utilities.newBlob(ordersCSV, 'text/csv', ordersFilename);
+
+          attachments.push({
+            fileName: ordersFilename,
+            content: ordersBlob,
+            mimeType: 'text/csv'
+          });
+        }
+      } catch (ordersError) {
+        console.error('generateCsvAttachments: Failed to generate Orders CSV attachment:', ordersError);
+        throw new Error(`Orders CSV generation failed: ${ordersError.message || ordersError}`);
+      }
+    }
+
+    // Generate Returns CSV attachment when returns data exists (more than just headers)
+    if (Array.isArray(rowsReturns) && rowsReturns.length > 1) {
+      try {
+        const returnsCSV = convertRowsToCSV(rowsReturns);
+        const returnsFilename = `${baseFilename}_Returns.csv`;
+
+        if (!returnsCSV) {
+          console.warn('generateCsvAttachments: Returns CSV conversion resulted in empty content');
+        } else {
+          const returnsBlob = Utilities.newBlob(returnsCSV, 'text/csv', returnsFilename);
+
+          attachments.push({
+            fileName: returnsFilename,
+            content: returnsBlob,
+            mimeType: 'text/csv'
+          });
+        }
+      } catch (returnsError) {
+        console.error('generateCsvAttachments: Failed to generate Returns CSV attachment:', returnsError);
+        throw new Error(`Returns CSV generation failed: ${returnsError.message || returnsError}`);
+      }
+    }
+
+    return attachments;
+  } catch (error) {
+    console.error('generateCsvAttachments: Critical error during attachment generation:', error);
+    throw new Error(`CSV attachment generation failed: ${error.message || error}`);
+  }
+}
+
+/* ============================================================================
  * MISC UTILITIES
  * ==========================================================================*/
 
 function formatNumber2(n) { return (Number(n).toFixed(2)); }
-function round2(n)        { return Math.round(Number(n) * 100) / 100; }
+function round2(n) { return Math.round(Number(n) * 100) / 100; }
 
 function pad(num, width) {
   const s = String(num);
