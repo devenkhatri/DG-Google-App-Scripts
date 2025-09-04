@@ -79,7 +79,6 @@ function exportGstCsvPromptForMonth() {
  * Builds Google Sheet directly in the configured Drive folder.
  */
 function exportGstCsvForMonth(year, month) {
-  const ui = SpreadsheetApp.getUi();
   try {
     // 1) Compute the selected month's time window & labels
     const { startIso, endIso, monthNameUpper, todayYmd, year: y, month: m } = getMonthRange(year, month, TIMEZONE);
@@ -136,7 +135,7 @@ function exportGstCsvForMonth(year, month) {
   } catch (err) {
     const uiMsg = `Export failed: ${err && err.message ? err.message : err}`;
     SpreadsheetApp.getActive().toast(uiMsg, 'Shopify GST Export — Error', 10);
-    ui.alert('Shopify GST Export — Error', uiMsg, ui.ButtonSet.OK);
+    console.error('Shopify GST Export — Error', uiMsg);
     throw err;
   }
 }
@@ -384,7 +383,7 @@ function loadCustomerNameLookup() {
  * Build all rows for the Google Sheet.
  */
 function buildSheetRows(orders) {
-  const customerNameLookup = loadCustomerNameLookup(); // load once
+  const customerNameLookup = loadCustomerNameLookup(); // load once  
 
   const headers = [
     'Order Number',
@@ -586,7 +585,7 @@ function computeGstBreakdown(gross, billToStateOrCode) {
 
   let igst = 0, cgst = 0, sgst = 0;
 
-  if (isGujarat) {
+  if (!isGujarat) {
     igst = gst;
   } else {
     cgst = round2(gst / 2);
@@ -718,15 +717,6 @@ function toQuery(obj) {
     parts.push(encodeURIComponent(k) + '=' + encodeURIComponent(String(v)));
   }
   return parts.join('&');
-}
-
-/**
- * Placeholder: implement the actual conversion if needed.
- * Converts a Qikink order number into your Shopify order number format (e.g., prepend/transform).
- */
-function convertQikinkOrderNumberToShopifyNumber(qikinkOrderNo) {
-  // Example (dummy): return '#KC' + String(qikinkOrderNo).replace(/\D+/g, '');
-  return String(qikinkOrderNo).trim();
 }
 
 /**
